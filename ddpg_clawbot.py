@@ -10,6 +10,12 @@ import random
 from collections import deque
 import numpy as np
 from typing import Tuple
+import signal
+import sys
+import time
+import datetime
+import os
+import glob
 
 class QNetwork(nn.Module):
   def __init__(self, obs: int, act: int):
@@ -96,8 +102,8 @@ class DDPG(nn.Module):
     self.policy_target.copyfrom(self.policy)  # Copy initial weights
 
     # Create optimizers for the Q-network and policy network, but not the target networks
-    self.q_optim = torch.optim.Adam(self.Q.parameters(), lr=0.001)
-    self.policy_optim = torch.optim.Adam(self.policy.parameters(), lr=0.001)
+    self.q_optim = torch.optim.Adam(self.Q.parameters(), lr=0.0001)
+    self.policy_optim = torch.optim.Adam(self.policy.parameters(), lr=0.0001)
 
   def fit(self, dataset: deque, num_samples: int=10, skip_every: int=5) -> Tuple[float, float]:
     """Sample from the dataset and do a training step of DDPG.
@@ -167,10 +173,66 @@ class DDPG(nn.Module):
 
 import gymnasium as gym
 from mujoco_env import ClawbotCan
+from model_manager import cleanup_all_old_models
+
+
+def save_model(agent, best_reward, episode, base_filename='ddpg_clawbot_model', 
+               save_type='completed'):
+  """Save model parameters to timestamped file
+  
+  Args:
+    agent: The DDPG agent
+    best_reward: Best reward achieved
+    episode: Current episode number
+    base_filename: Base name for the model file
+    save_type: Type of save ('completed', 'interrupted', 'checkpoint')
+  """
+  # Create timestamp for unique filename
+  timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+  filename = f"{base_filename}_{save_type}_{timestamp}.pth"
+  
+  # Save model data
+  model_data = {
+    'policy_state_dict': agent.policy.state_dict(),
+    'q_network_state_dict': agent.Q.state_dict(),
+    'policy_optimizer_state_dict': agent.policy_optim.state_dict(),
+    'q_optimizer_state_dict': agent.q_optim.state_dict(),
+    'best_total_reward': best_reward,
+    'last_episode': episode,
+    'save_type': save_type,
+    'timestamp': timestamp,
+    'save_time': datetime.datetime.now().isoformat()
+  }
+  
+  torch.save(model_data, filename)
+  print(f"💾 Model saved to {filename} at episode {episode} with best reward: {best_reward:.2f}")
+  
+  return filename
+
+def signal_handler(signum, frame, agent, best_reward, episode):
+  """Handle Ctrl+C interruption by saving the model"""
+  print(f"\n🛑 Training interrupted! Saving model at episode {episode}...")
+  filename = save_model(agent, best_reward, episode, save_type='interrupted')
+  print(f"✅ Model safely saved. You can resume training or evaluate using: {filename}")
+  sys.exit(0)
 
 if __name__ == "__main__":
-  # Import and create an environment
-  env = ClawbotCan()
+  # Clean up old models before starting new training
+  print("🧹 Cleaning up old model files before starting training...")
+  cleanup_all_old_models(keep_count=3)
+  
+  # Environment configuration parameters
+  CAN_X_RANGE = (-0.75, 0.75)      # X position range for can
+  CAN_Y_RANGE = (0.4, 0.75)        # Y position range for can (forward hemisphere, away from claw)
+  MIN_DISTANCE = 0.4               # Minimum distance between robot and can (always away from claw)
+  
+  print(f"🤖 Environment Configuration:")
+  print(f"   Can X range: {CAN_X_RANGE[0]} to {CAN_X_RANGE[1]}")
+  print(f"   Can Y range: {CAN_Y_RANGE[0]} to {CAN_Y_RANGE[1]}")
+  print(f"   Min distance: {MIN_DISTANCE}")
+  
+  # Create environment with configurable parameters
+  env = ClawbotCan(can_x_range=CAN_X_RANGE, can_y_range=CAN_Y_RANGE, min_distance=MIN_DISTANCE)
   # Create agent and dataset storage
   agent = DDPG(obs_dim=3, act_dim=4)
   dataset = deque(maxlen=100000) # (obs, act, new_obs, rew, terminal)
@@ -179,9 +241,22 @@ if __name__ == "__main__":
   best_total_reward = -float('inf')
   last_q_error = 0.0
   last_policy_error = 0.0
+  total_episodes = 10000
+  render_threshold = total_episodes - 5  # 90% of training
+  current_episode = 0
+  render_new_best = False  # Flag to render when hitting new best reward
+  checkpoint_interval = 1000  # Save checkpoint every 1000 episodes
+  last_checkpoint_episode = 0
 
-  # Train for 10000 episodes
-  for episode in range(10000):
+  # Set up signal handler for Ctrl+C
+  def interrupt_handler(signum, frame):
+    signal_handler(signum, frame, agent, best_total_reward, current_episode)
+  
+  signal.signal(signal.SIGINT, interrupt_handler)
+
+  # Train for episodes
+  for episode in range(total_episodes):
+    current_episode = episode
     obs, info = env.reset()
     total_reward = 0
 
@@ -193,6 +268,12 @@ if __name__ == "__main__":
       # print(action)
       # Try the action out
       new_obs, rew, term, info = env.step(action)
+      
+      # Render environment if conditions are met
+      should_render = (episode >= render_threshold or (total_reward > 0 or render_new_best))
+      if should_render:
+        env.render()
+        time.sleep(0.05)  # Slow down rendering for better visibility
 
       # Store the result in the dataset and redefine the current observation
       term = term or step == 199 # terminal if we reached the time limit
@@ -206,7 +287,36 @@ if __name__ == "__main__":
         last_q_error = q_err
         last_policy_error = policy_err
       if term:
+        # Check if we hit a new best reward and should render next episode
+        if total_reward > best_total_reward and total_reward > 0:
+          render_new_best = True
+          print(f'🎉 NEW BEST REWARD: {total_reward:.2f} (rendering next episode)')
+        else:
+          render_new_best = False
+          
         best_total_reward = max(best_total_reward, total_reward)
         print(f'Total Reward: {total_reward:.2f} Episode: {episode} Steps: {step} Q Loss: {last_q_error:.4f} Policy Loss: {last_policy_error:.4f}')
+        
+        # Save checkpoint periodically
+        if episode - last_checkpoint_episode >= checkpoint_interval:
+          print(f"💾 Saving checkpoint at episode {episode}...")
+          save_model(agent, best_total_reward, episode, save_type='checkpoint')
+          last_checkpoint_episode = episode
+          
+          # Clean up old models every few checkpoints to keep storage manageable
+          if episode % (checkpoint_interval * 3) == 0:  # Every 3000 episodes
+            cleanup_all_old_models(keep_count=2, verbose=False)
+        
         break
+
+  # Save model parameters after training completion
+  print(f"\n🎉 Training completed successfully!")
+  filename = save_model(agent, best_total_reward, total_episodes, save_type='completed')
+  print(f"✅ Final model saved as: {filename}")
+  
+  # Final cleanup to keep only the most important models
+  print("🧹 Final cleanup of old model files...")
+  cleanup_all_old_models(keep_count=2)
+  
+  # Close environment
   env.close()

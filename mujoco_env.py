@@ -35,12 +35,28 @@ def bug_fix_angles(qpos, idx=None):
   return qpos
 
 class ClawbotCan:
-  def __init__(self, mujoco_model_path: str="env/clawbot.xml"):
+  def __init__(self, mujoco_model_path: str="env/clawbot.xml", 
+               can_x_range: tuple=(-0.75, 0.75),
+               can_y_range: tuple=(0.4, 0.75),
+               min_distance: float=0.4):
+    """Initialize ClawbotCan environment
+    
+    Args:
+        mujoco_model_path: Path to the MuJoCo XML model
+        can_x_range: (min_x, max_x) range for can X position
+        can_y_range: (min_y, max_y) range for can Y position  
+        min_distance: Minimum distance between robot and can
+    """
     with open(mujoco_model_path, 'r') as fp:
       model_xml = fp.read()
     self.model = mujoco.MjModel.from_xml_string(model_xml)
     self.data = mujoco.MjData(self.model)
     self.time_duration = 0.05
+    
+    # Store positioning parameters
+    self.can_x_range = can_x_range
+    self.can_y_range = can_y_range
+    self.min_distance = min_distance
 
     self.sensor_names = [self.model.sensor_adr[i] for i in range(self.model.nsensor)]
     self.actuator_names = [mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) for i in range(self.model.nu)]
@@ -84,18 +100,19 @@ class ClawbotCan:
       claw_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "virtual_claw_target")
       claw_pos = self.data.xpos[claw_id]  # [x, y, z] in world frame
 
-      dx = claw_pos[0] - can1_pos[0]
-      dy = claw_pos[1] - can1_pos[1]
-      dz = claw_pos[2] - can1_pos[2]
+      dx = can1_pos[0] - claw_pos[0]  # Direction FROM claw TO can
+      dy = can1_pos[1] - claw_pos[1]  # Direction FROM claw TO can
+      dz = can1_pos[2] - claw_pos[2]
       distance = np.sqrt(dx * dx + dy * dy + dz * dz)
-      heading = np.arctan2(dy, dx) + np.pi/2
+      heading = np.arctan2(dy, dx)  # Angle to target
       # print("Distance:", dist, "Heading:", heading)
 
       roll, pitch, yaw = quaternion_to_euler(self.data.xquat[claw_id])
       # print("Yaw:", yaw)
-      # yaw 0 is North, -pi is East, pi is West, 2pi is South
-
-      dtheta = bug_fix_angles([yaw - heading])[0]
+      # yaw 0 is East (positive X), so adjust to make 0 = North (positive Y)
+      robot_heading = yaw + np.pi/2  # Convert from East=0 to North=0
+      
+      dtheta = bug_fix_angles([robot_heading - heading])[0]
       # print("Dtheta:", dtheta)
 
       return np.array([distance, dtheta, objectGrabbed]), np.concatenate([np.array([dtheta, dx, dy]), claw_pos], -1)
@@ -120,8 +137,8 @@ class ClawbotCan:
     can1_qposadr = self.model.jnt_qposadr[can1_jntadr]
 
     pos = (0, 0)
-    while np.sqrt(pos[0] * pos[0] + pos[1] * pos[1]) < 0.3:
-      pos = (np.random.uniform(-0.75, 0.75), np.random.uniform(0.1, 0.75))
+    while np.sqrt(pos[0] * pos[0] + pos[1] * pos[1]) < self.min_distance:
+      pos = (np.random.uniform(*self.can_x_range), np.random.uniform(*self.can_y_range))
     self.data.qpos[can1_qposadr+0] = pos[0]
     self.data.qpos[can1_qposadr+1] = pos[1]
 
@@ -164,3 +181,12 @@ class ClawbotCan:
     else:
       self.viewer.close()
       self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+  
+  def close(self):
+    """Close the environment and clean up resources."""
+    if hasattr(self, 'viewer') and self.viewer is not None:
+      try:
+        self.viewer.close()
+        self.viewer = None
+      except:
+        pass
