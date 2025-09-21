@@ -129,12 +129,12 @@ class ClawbotCan:
     mujoco.mj_forward(self.model, self.data)
     bug_fix_angles(self.data.qpos)
     sensor_values = self.data.sensordata.copy()
-    return self._calc_state()[0]
+    return self._calc_state()
 
   def step(self, action, time_duration=0.05):
-    # for now, disable arm
-    action[2] = 0
-    action[3] = action[3] / 2 - 0.5
+    # for now, disable arm, and restrict the claw to only move in the open direction
+    action[2] = 0 # TODO: to disable the arm
+    action[3] = action[3] / 2 - 0.5 # TODO: To restrict the claw to only move in the open direction
 
     self.prev_action = action = \
       np.clip(np.array(action) - self.prev_action, -0.25, 0.25) + self.prev_action
