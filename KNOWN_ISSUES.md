@@ -39,6 +39,31 @@ The TD3 model exhibits problematic behavior where it:
 - ❌ TD3: Moves backward while aligning
 - ❓ DDPG: Behavior unknown
 
+### SAC Algorithm - No Forward Locomotion / Claw Reward Exploitation
+**Status**: 🔴 **CRITICAL** - Needs Fix  
+**Algorithm**: SAC (Soft Actor-Critic)  
+**Issue**: Orients toward the object but does not drive forward; repeatedly opens/closes the claw to farm reward  
+**Impact**: Fails to approach objects; 0/12 test passes in evaluation, no successful grabs  
+**Discovered**: 2025-09-22 during unified evaluation
+
+**Description**:
+- SAC consistently rotates to face the target but remains largely stationary.
+- It oscillates the gripper (open/close) to collect reward signal without making translational progress.
+- Evaluation summary indicates poor approach behavior (e.g., average final distance ≈ 0.63 m; 0/12 success).
+
+**Potential Causes**:
+1. Reward shaping allows gripper-related incentives without sufficient progress-based rewards.
+2. Per-step distance decrease is under-weighted relative to movement penalties and time penalty.
+3. Claw bonus not gated by proximity/alignment, enabling reward hacking from afar.
+4. Temperature/entropy encourages dithering over committing to forward motion.
+
+**Suggested Fixes**:
+1. Gate grab/close bonuses on proximity (e.g., distance < 0.15 m) and good alignment (|dtheta| < 0.3).
+2. Add step-wise progress shaping: positive reward for distance reduction; penalty for distance increase.
+3. Add penalty for gripper actuation when far or misaligned (anti-spam term).
+4. Soften forward-movement penalties when well aligned; encourage approach once |dtheta| is small.
+5. Tune SAC temperature (alpha) or use auto-alpha with tighter target entropy to reduce dithering.
+
 ---
 
 ## 🔴 Critical Real-World Performance Issues

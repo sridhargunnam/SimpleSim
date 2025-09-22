@@ -84,6 +84,10 @@ class ClawbotCan:
 
     self.viewer = None
     self.prev_action = np.array([0.0, 0.0, 0.0, 0.0]) # ramping
+    # Track last distance and action to shape progress and stability rewards
+    self.last_distance = None
+    self.no_progress_steps = 0
+    self.last_action = np.array([0.0, 0.0, 0.0, 0.0])
 
   def _calc_state(self):
       # Calculate reward and termination
@@ -212,8 +216,35 @@ class ClawbotCan:
     # Object grabbed bonus (unchanged)
     grab_bonus = int(objectGrabbed) * 50
     
-    # Small time penalty to encourage efficiency
-    time_penalty = -0.1
+    # Progress and stability shaping
+    # Encourage steady approach, penalize stagnation and moving away
+    delta_distance = 0.0 if self.last_distance is None else (self.last_distance - distance)
+    # Reward progress (moving closer) modestly
+    progress_reward = 2.0 * max(delta_distance, 0.0)
+    # Penalize moving away proportionally
+    away_penalty = -4.0 * max(-delta_distance, 0.0)
+    # Penalize sustained lack of progress to avoid dithering/jitter
+    min_progress_threshold = 0.002  # 2 mm per step considered meaningful
+    if delta_distance < min_progress_threshold and not objectGrabbed:
+        self.no_progress_steps = min(self.no_progress_steps + 1, 50)
+    else:
+        self.no_progress_steps = 0
+    stagnation_penalty = -0.2 * self.no_progress_steps
+    
+    # Penalize being close but not in a grabbable alignment window
+    grabbable_penalty = 0.0
+    if distance < 0.20 and abs(dtheta) > 0.30 and not objectGrabbed:
+        grabbable_penalty = -6.0
+    
+    # Mild dynamic time penalty that increases as steps elapse
+    time_penalty = -0.05 - 0.05 * (self._steps / self.max_steps)
+    
+    # Anti-jitter: penalize abrupt action changes (after built-in ramping)
+    try:
+        action_change = float(np.sum(np.abs(action - self.last_action[:len(action)])))
+    except Exception:
+        action_change = 0.0
+    jitter_penalty = -0.5 * max(action_change - 0.3, 0.0)
     
     # Fix 1: Penalty for can being behind the claw (wrong position for grabbing)
     behind_claw_penalty = 0
@@ -230,7 +261,11 @@ class ClawbotCan:
             stuck_penalty = -5.0  # Penalty for being stuck when should be active
     
     total_reward = (approach_reward + alignment_bonus + close_approach_bonus + 
-                   grab_bonus + time_penalty + behind_claw_penalty + stuck_penalty)
+                   grab_bonus + time_penalty + behind_claw_penalty + stuck_penalty +
+                   progress_reward + away_penalty + stagnation_penalty + grabbable_penalty + jitter_penalty)
+    
+    # Update last_distance for next step
+    self.last_distance = distance
     
     return total_reward
 
@@ -264,7 +299,12 @@ class ClawbotCan:
     mujoco.mj_forward(self.model, self.data)
     bug_fix_angles(self.data.qpos, idx=self.hinge_joint_qpos_indices)
     sensor_values = self.data.sensordata.copy()
-    return self._calc_state()
+    s, info = self._calc_state()
+    # Initialize progress tracking
+    self.last_distance = float(s[0])
+    self.no_progress_steps = 0
+    self.last_action = np.array([0.0, 0.0, 0.0, 0.0])
+    return s, info
 
   def step(self, action, time_duration=0.05):
     # for now, disable arm, and restrict the claw to only move in the open direction
@@ -290,6 +330,12 @@ class ClawbotCan:
             # Debug info (can be removed later)
             # print(f"🔄 Forced rotation: dtheta={dtheta:.2f}, turn_dir={turn_direction}")
 
+    # Preserve last executed (filtered) action for anti-jitter shaping
+    try:
+        self.last_action = self.prev_action.copy()
+    except Exception:
+        self.last_action = np.array([0.0, 0.0, 0.0, 0.0])
+    
     self.prev_action = action = \
       np.clip(np.array(action) - self.prev_action, -0.25, 0.25) + self.prev_action
     for i, a in enumerate(action):
