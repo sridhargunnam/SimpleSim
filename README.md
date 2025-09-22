@@ -52,6 +52,53 @@ Run an example program to control the robot. You can use W(↑) A(←) S(↓) D(
 python3 main.py
 ```
 
+## RL Model Training & Evaluation
+
+This repository includes comprehensive reinforcement learning implementations for the clawbot environment:
+
+### Available RL Algorithms
+- **DDPG** (Deep Deterministic Policy Gradient) - `ddpg_clawbot.py`
+- **TD3** (Twin Delayed Deep Deterministic Policy Gradient) - `td3_clawbot.py` 
+- **SAC** (Soft Actor-Critic) - `sac_clawbot.py`
+- **PPO** (Proximal Policy Optimization) - `ppo_clawbot.py`
+
+### Quick Start - RL Training
+```bash
+# Train a PPO model (recommended for beginners)
+python ppo_clawbot.py
+
+# Train an SAC model (excellent exploration)
+python sac_clawbot.py
+
+# Train a TD3 model (stable continuous control)
+python td3_clawbot.py
+```
+
+### Model Evaluation & Video Recording
+```bash
+# List all trained models
+python model_manager.py list
+
+# Evaluate latest model with video recording
+python video_evaluator.py ppo_clawbot_model_completed_*.pth
+
+# Screen recording approach (more reliable)
+python simple_video_eval.py ppo_clawbot_model_completed_*.pth 5
+
+# Compare multiple models
+python unified_evaluator.py model1.pth
+python unified_evaluator.py model2.pth
+```
+
+### Video Output
+Videos are automatically saved to `runlogs/evaluation_videos/` showing:
+- Individual test scenarios with different can positions
+- Robot navigation and manipulation behavior
+- Success/failure analysis across multiple attempts
+- Algorithm comparison videos
+
+See `README_evaluation.md` for detailed evaluation documentation, `KNOWN_ISSUES.md` for current algorithm issues, and `IMPROVEMENT_ROADMAP.md` for planned enhancements to bridge the simulation-to-reality gap.
+
 ### Example code
 A full example code to manually control the robot can be seen here:
 

@@ -145,18 +145,23 @@ def cleanup_old_models_by_pattern(pattern: str, keep_count: int = 2):
         return removed_count
     return 0
 
-def cleanup_all_old_models(keep_count: int = 3, verbose: bool = True):
+def cleanup_all_old_models(keep_count: int = 3, verbose: bool = True, model_pattern: str = None):
     """Clean up old models of all types, keeping only the most recent ones"""
-    model_patterns = [
-        'ddpg_clawbot_model_completed_*.pth',
-        'ddpg_clawbot_model_interrupted_*.pth', 
-        'ddpg_clawbot_model_checkpoint_*.pth'
-    ]
-    
-    total_removed = 0
-    for pattern in model_patterns:
-        removed = cleanup_old_models_by_pattern(pattern, keep_count)
-        total_removed += removed
+    if model_pattern:
+        # Use specific pattern if provided
+        total_removed = cleanup_old_models_by_pattern(model_pattern, keep_count)
+    else:
+        # Default to DDPG patterns for backward compatibility
+        model_patterns = [
+            'ddpg_clawbot_model_completed_*.pth',
+            'ddpg_clawbot_model_interrupted_*.pth', 
+            'ddpg_clawbot_model_checkpoint_*.pth'
+        ]
+        
+        total_removed = 0
+        for pattern in model_patterns:
+            removed = cleanup_old_models_by_pattern(pattern, keep_count)
+            total_removed += removed
     
     if total_removed > 0 and verbose:
         print(f"🧹 Cleanup complete: {total_removed} old model files removed (keeping {keep_count} most recent of each type)")

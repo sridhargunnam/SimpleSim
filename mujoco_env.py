@@ -58,12 +58,20 @@ class ClawbotCan:
     self.can_y_range = can_y_range
     self.min_distance = min_distance
 
+    # Fix: Identify hinge joint indices for safe angle wrapping
+    self.hinge_joint_qpos_indices = []
+    for i in range(self.model.njnt):
+        if self.model.jnt_type[i] == mujoco.mjtJoint.mjJNT_HINGE:
+            qpos_start = self.model.jnt_qposadr[i]
+            qpos_size = 1  # Hinge joints have 1 DOF
+            self.hinge_joint_qpos_indices.extend(range(qpos_start, qpos_start + qpos_size))
+
     self.sensor_names = [self.model.sensor_adr[i] for i in range(self.model.nsensor)]
     self.actuator_names = [mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) for i in range(self.model.nu)]
     self.body_names = self.model.names.decode('utf-8').split('\x00')[1:]
 
     self._steps = 0
-    self.max_steps = 1000
+    self.max_steps = 1500  # Increased from 1000 to allow more time for complex maneuvers
     self.observation_space = namedtuple('Box', ['high', 'low', 'shape'])
     # self.observation_space.shape = (self.model.nsensor,)
     self.observation_space.shape = (3,)
@@ -115,15 +123,124 @@ class ClawbotCan:
       dtheta = bug_fix_angles([robot_heading - heading])[0]
       # print("Dtheta:", dtheta)
 
-      return np.array([distance, dtheta, objectGrabbed]), np.concatenate([np.array([dtheta, dx, dy]), claw_pos], -1)
+      # Additional state information for reward calculation
+      # Check if can is behind the claw (negative Y relative to robot)
+      can_behind_claw = dy < -0.1  # Can is behind the claw position
+      
+      # Return enhanced state with positional information
+      return np.array([distance, dtheta, objectGrabbed]), {
+          'dx': dx, 'dy': dy, 'dz': dz, 
+          'claw_pos': claw_pos, 'can_pos': can1_pos,
+          'can_behind_claw': can_behind_claw,
+          'heading': heading, 'robot_heading': robot_heading
+      }
 
-  def reward(self, state, action):
+  def reward(self, state, action, info=None):
     distance, dtheta, objectGrabbed = state
-    return -distance - np.abs(dtheta) + int(objectGrabbed) * 50
+    
+    # Get additional state information for enhanced reward calculation
+    if info is None:
+        # If no info provided, calculate it (for backward compatibility)
+        _, info = self._calc_state()
+    
+    can_behind_claw = info.get('can_behind_claw', False)
+    dy = info.get('dy', 0)
+    
+    # Check if claw is touching the can (but not grabbing)
+    # Note: objectGrabbed is already calculated from the same touch sensors in _calc_state
+    # We need to detect "touching but not grabbing" state
+    is_touching_can = objectGrabbed  # For now, treat any touch as potential sweeping
+    # TODO: Could be refined to detect partial vs full contact
+    
+    # Enhanced "Rotation Always First" Reward Function
+    # Key insight: Rotation priority increases when closer (less room for error)
+    
+    # Calculate rotation priority multiplier based on distance
+    # Closer = higher rotation priority (more critical alignment)
+    rotation_priority = 1.0 + (1.0 - min(distance, 1.0))  # Range: 1.0 to 2.0
+    
+    # Always prioritize rotation, but intensity varies by distance and angle
+    rotation_reward = -rotation_priority * 8 * np.abs(dtheta)
+    
+    # Distance penalty with anti-sweeping and wrong-position detection
+    if objectGrabbed:
+        # When grabbed: No distance penalty (success!), encourage episode completion
+        distance_penalty = 0  
+        wrong_position_penalty = 0
+    else:
+        # Normal distance penalty when not grabbed
+        distance_penalty = -2 * distance
+        
+        # Anti-sweeping: Penalty for being very close but not grabbing
+        # This prevents robot from just pushing the can around
+        if distance < 0.12 and not objectGrabbed:  # Very close but no grab
+            wrong_position_penalty = -8.0  # Penalty for being too close without success
+        else:
+            wrong_position_penalty = 0
+    
+    # Severely penalize forward movement when ANY misalignment exists
+    forward_movement = abs(action[0] + action[1]) / 2  # Average wheel speed
+    angle_tolerance = 0.2  # ~11.5 degrees - very tight tolerance
+    
+    if abs(dtheta) > angle_tolerance:
+        # Any misalignment > 11.5° prohibits forward movement
+        movement_penalty = -25 * forward_movement if forward_movement > 0.1 else 0
+    else:
+        # Only when very well aligned, allow forward movement
+        movement_penalty = 0
+    
+    approach_reward = rotation_reward + distance_penalty + movement_penalty + wrong_position_penalty
+    
+    # Progressive bonuses for good alignment
+    if abs(dtheta) < 0.1:  # < 5.7° - excellent alignment
+        alignment_bonus = 10.0
+    elif abs(dtheta) < 0.3:  # < 17.2° - good alignment  
+        alignment_bonus = 5.0
+    elif abs(dtheta) < 0.5:  # < 28.6° - acceptable alignment
+        alignment_bonus = 2.0
+    else:
+        alignment_bonus = 0.0
+    
+    # Close approach bonus (only when well aligned)
+    if distance < 0.15 and abs(dtheta) < 0.3:
+        close_approach_bonus = 8.0
+    elif distance < 0.25 and abs(dtheta) < 0.2:
+        close_approach_bonus = 4.0
+    else:
+        close_approach_bonus = 0.0
+    
+    # Object grabbed bonus (unchanged)
+    grab_bonus = int(objectGrabbed) * 50
+    
+    # Small time penalty to encourage efficiency
+    time_penalty = -0.1
+    
+    # Fix 1: Penalty for can being behind the claw (wrong position for grabbing)
+    behind_claw_penalty = 0
+    if can_behind_claw and distance < 0.3:  # Only penalize if close AND behind
+        behind_claw_penalty = -15.0  # Heavy penalty for being in wrong position
+    
+    # Fix 2: Penalty for robot being stuck (not moving)
+    stuck_penalty = 0
+    movement_magnitude = abs(action[0]) + abs(action[1])  # Total wheel movement
+    if movement_magnitude < 0.05:  # Very low movement
+        # Check if robot should be moving (not well aligned and close)
+        should_be_moving = (abs(dtheta) > 0.1 or distance > 0.2)
+        if should_be_moving:
+            stuck_penalty = -5.0  # Penalty for being stuck when should be active
+    
+    total_reward = (approach_reward + alignment_bonus + close_approach_bonus + 
+                   grab_bonus + time_penalty + behind_claw_penalty + stuck_penalty)
+    
+    return total_reward
 
   def terminal(self, state, action):
-    _, __, objectGrabbed = state
-    return self._steps >= 1000 or objectGrabbed or np.cos(state[1]) < 0
+    distance, dtheta, objectGrabbed = state
+    # Fix: Much more lenient angle termination - only fail if facing completely wrong (>150°)
+    is_facing_completely_wrong = abs(dtheta) > (5 * np.pi / 6)  # 150 degrees
+    # Also terminate if robot gets stuck very far away
+    is_too_far = distance > 2.0
+    return self._steps >= 1500 or objectGrabbed or is_facing_completely_wrong or is_too_far
 
   def reset(self):
     self.prev_action = np.array([0.0, 0.0, 0.0, 0.0]) 
@@ -142,9 +259,10 @@ class ClawbotCan:
     self.data.qpos[can1_qposadr+0] = pos[0]
     self.data.qpos[can1_qposadr+1] = pos[1]
 
-    bug_fix_angles(self.data.qpos)
+    # Fix: Only apply angle wrapping to hinge joints, not free joints
+    bug_fix_angles(self.data.qpos, idx=self.hinge_joint_qpos_indices)
     mujoco.mj_forward(self.model, self.data)
-    bug_fix_angles(self.data.qpos)
+    bug_fix_angles(self.data.qpos, idx=self.hinge_joint_qpos_indices)
     sensor_values = self.data.sensordata.copy()
     return self._calc_state()
 
@@ -153,6 +271,25 @@ class ClawbotCan:
     action[2] = 0 # TODO: to disable the arm
     action[3] = action[3] / 2 - 0.5 # TODO: To restrict the claw to only move in the open direction
 
+    # Option 2: Force rotation-only behavior when misaligned
+    # Get current state to check alignment
+    current_state, _ = self._calc_state()
+    distance, dtheta, objectGrabbed = current_state
+    
+    if abs(dtheta) > 0.2:  # ANY misalignment > 11.5° - force rotation-only
+        forward_component = (action[0] + action[1]) / 2
+        if forward_component > 0.1:  # Agent trying to move forward when misaligned
+            # Convert to pure rotation based on the intended direction
+            rotation_strength = forward_component  # Use the forward intent as rotation strength
+            turn_direction = 1 if dtheta > 0 else -1  # Turn toward target
+            
+            # Override actions to pure rotation
+            action[0] = rotation_strength * turn_direction   # Left wheel
+            action[1] = -rotation_strength * turn_direction  # Right wheel (opposite)
+            
+            # Debug info (can be removed later)
+            # print(f"🔄 Forced rotation: dtheta={dtheta:.2f}, turn_dir={turn_direction}")
+
     self.prev_action = action = \
       np.clip(np.array(action) - self.prev_action, -0.25, 0.25) + self.prev_action
     for i, a in enumerate(action):
@@ -160,14 +297,15 @@ class ClawbotCan:
     t = time_duration
     while t - self.model.opt.timestep > 0:
       t -= self.model.opt.timestep
-      bug_fix_angles(self.data.qpos)
+      # Fix: Only apply angle wrapping to hinge joints, not free joints
+      bug_fix_angles(self.data.qpos, idx=self.hinge_joint_qpos_indices)
       mujoco.mj_step(self.model, self.data)
-      bug_fix_angles(self.data.qpos)
+      bug_fix_angles(self.data.qpos, idx=self.hinge_joint_qpos_indices)
     sensor_values = self.data.sensordata.copy()
     s, info = self._calc_state()
     obs = s
     self._steps += 1
-    reward_value = self.reward(s, action)
+    reward_value = self.reward(s, action, info)
     terminal_value = self.terminal(s, action)
 
     return obs, reward_value, terminal_value, info

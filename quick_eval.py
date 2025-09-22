@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Quick Model Evaluation Script
-Run specific test scenarios or a quick evaluation
+Quick Evaluation Script for All RL Algorithms
+A lightweight version of the evaluator for quick testing and comparison
 """
 
-from model_evaluator import ModelEvaluator
-import sys
-import os
+from unified_evaluator import UnifiedModelEvaluator
 import numpy as np
+import time
+import glob
+import os
 
-def quick_test(model_path=None, angle_range=(-90, 90), distance_range=(0.4, 0.75), 
+def quick_test(model_path=None, num_episodes=5, render=True, verbose=True, 
+               angle_range=(-90, 90), distance_range=(0.4, 0.75),
                can_x_range=(-0.75, 0.75), can_y_range=(0.4, 0.75)):
-    """Run a few quick tests to check model performance
+    """Quick test of any trained model"""
     
-    Args:
-        model_path: Path to model file (auto-detected if None)
-        angle_range: (min_angle, max_angle) in degrees for test scenarios
-        distance_range: (min_dist, max_dist) for test scenarios
-        can_x_range: (min_x, max_x) for training environment setup
-        can_y_range: (min_y, max_y) for training environment setup
-    """
-    import glob
-    
-    if model_path and os.path.exists(model_path):
-        print(f"🎯 Quick Evaluation with specified model: {model_path}")
-    else:
-        # Look for any model files (timestamped or old format)
+    if not model_path:
+        # Find the most recent model of any algorithm
         patterns = [
             'ddpg_clawbot_model_*.pth',
-            'ddpg_clawbot_model.pth'
+            'td3_clawbot_model_*.pth', 
+            'sac_clawbot_model_*.pth',
+            'ppo_clawbot_model_*.pth'
         ]
         
         all_models = []
@@ -36,56 +31,217 @@ def quick_test(model_path=None, angle_range=(-90, 90), distance_range=(0.4, 0.75
             all_models.extend(glob.glob(pattern))
         
         if not all_models:
-            print("❌ No saved models found!")
+            print("❌ No saved models found")
             return
         
-        # Use the most recent model
-        model_path = max(all_models, key=os.path.getmtime)
-        print(f"🚀 Quick Evaluation with most recent model: {model_path}")
+        # Use most recent
+        all_models.sort(key=os.path.getmtime, reverse=True)
+        model_path = all_models[0]
+        print(f"🎯 Using most recent model: {model_path}")
     
-    print(f"📐 Test Parameters:")
-    print(f"   Angle range: {angle_range[0]}° to {angle_range[1]}°")
-    print(f"   Distance range: {distance_range[0]} to {distance_range[1]}")
-    print(f"   Training can X range: {can_x_range[0]} to {can_x_range[1]}")
-    print(f"   Training can Y range: {can_y_range[0]} to {can_y_range[1]}")
+    try:
+        evaluator = UnifiedModelEvaluator(
+            model_path=model_path,
+            can_x_range=can_x_range,
+            can_y_range=can_y_range,
+            angle_range_deg=angle_range,
+            distance_range=distance_range
+        )
+        print(f"✅ {evaluator.algorithm_type} Model loaded successfully")
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return
     
-    # Create evaluator with specified parameters
-    evaluator = ModelEvaluator(
-        model_path=model_path,
-        can_x_range=can_x_range,
-        can_y_range=can_y_range,
-        angle_range_deg=angle_range,
-        distance_range=distance_range
-    )
+    successes = 0
+    total_rewards = []
+    min_distances = []
+    angle_errors = []
     
-    # Generate test scenarios using the evaluator's parameterized method
-    quick_scenarios = evaluator.generate_test_scenarios(num_tests=3, seed=123)
+    print(f"\n🚀 Running {num_episodes} test episodes...")
+    print("-" * 50)
     
-    results = []
-    for scenario_name, can_x, can_y in quick_scenarios:
+    # Generate test scenarios
+    test_scenarios = evaluator.generate_test_scenarios(num_tests=num_episodes, seed=42)
+    
+    for i, (scenario_name, can_x, can_y) in enumerate(test_scenarios):
+        print(f"\n📍 Test {i+1}: {scenario_name}")
+        print(f"   Can at: ({can_x:.2f}, {can_y:.2f})")
+        
         result = evaluator.run_test_scenario(
-            scenario_name=scenario_name,
+            scenario_name=f"Quick Test {i+1}",
             can_x=can_x,
             can_y=can_y,
-            max_steps=100,
-            render=True,
-            render_delay=0.08
+            max_steps=150,
+            render=render,
+            render_delay=0.02 if render else 0
         )
-        results.append(result)
+        
+        if result['success']:
+            successes += 1
+        
+        total_rewards.append(result['total_reward'])
+        min_distances.append(result['min_distance_achieved'])
+        angle_errors.append(result['avg_angle_error_deg'])
+        
+        if not verbose:
+            status = "✅ SUCCESS" if result['success'] else "❌ FAILED"
+            print(f"   {status} - Reward: {result['total_reward']:.2f}")
     
-    # Quick summary
-    successful = sum(1 for r in results if r['success'])
-    grabbed = sum(1 for r in results if r['object_grabbed'])
-    avg_reward = sum(r['total_reward'] for r in results) / len(results)
+    # Summary
+    success_rate = (successes / num_episodes) * 100
+    avg_reward = np.mean(total_rewards)
+    avg_min_distance = np.mean(min_distances)
+    avg_angle_error = np.mean(angle_errors)
     
-    print(f"\n🎯 Quick Summary:")
-    print(f"   Success rate: {successful}/{len(results)}")
-    print(f"   Grab rate: {grabbed}/{len(results)}")
-    print(f"   Average reward: {avg_reward:.2f}")
+    print("\n" + "="*60)
+    print(f"📊 QUICK EVALUATION RESULTS ({evaluator.algorithm_type})")
+    print("="*60)
+    print(f"Episodes:              {num_episodes}")
+    print(f"Successes:             {successes}")
+    print(f"Success Rate:          {success_rate:.1f}%")
+    print(f"Avg Reward:            {avg_reward:.2f}")
+    print(f"Reward Range:          {min(total_rewards):.2f} to {max(total_rewards):.2f}")
+    print(f"Avg Min Distance:      {avg_min_distance:.3f}")
+    print(f"Avg Angle Error:       {avg_angle_error:.1f}°")
+    print(f"Test Configuration:")
+    print(f"  Angle Range:         {angle_range[0]}° to {angle_range[1]}°")
+    print(f"  Distance Range:      {distance_range[0]} to {distance_range[1]}")
+    
+    # Performance assessment
+    if success_rate >= 80:
+        print("🎉 Model performance: EXCELLENT")
+    elif success_rate >= 60:
+        print("👍 Model performance: GOOD")
+    elif success_rate >= 40:
+        print("⚠️  Model performance: FAIR")
+    else:
+        print("😟 Model performance: POOR - needs more training")
     
     evaluator.env.close()
+    
+    return {
+        'algorithm': evaluator.algorithm_type,
+        'success_rate': success_rate / 100,
+        'avg_reward': avg_reward,
+        'avg_min_distance': avg_min_distance,
+        'avg_angle_error': avg_angle_error,
+        'num_episodes': num_episodes
+    }
+
+def compare_algorithms():
+    """Compare all available algorithms"""
+    print("🔍 ALGORITHM COMPARISON MODE")
+    print("=" * 80)
+    
+    # Find models for each algorithm
+    algorithm_patterns = {
+        'DDPG': 'ddpg_clawbot_model_*.pth',
+        'TD3': 'td3_clawbot_model_*.pth',
+        'SAC': 'sac_clawbot_model_*.pth', 
+        'PPO': 'ppo_clawbot_model_*.pth'
+    }
+    
+    available_algorithms = {}
+    for algorithm, pattern in algorithm_patterns.items():
+        models = glob.glob(pattern)
+        if models:
+            # Use most recent model
+            latest_model = max(models, key=os.path.getmtime)
+            available_algorithms[algorithm] = latest_model
+    
+    if len(available_algorithms) < 2:
+        print("❌ Need at least 2 different algorithms trained for comparison")
+        return
+    
+    print(f"📋 Found models for {len(available_algorithms)} algorithms:")
+    for algorithm, model_path in available_algorithms.items():
+        print(f"   {algorithm}: {model_path}")
+    
+    # Test each algorithm
+    results = {}
+    for algorithm, model_path in available_algorithms.items():
+        print(f"\n{'='*60}")
+        print(f"🤖 Testing {algorithm}")
+        print('='*60)
+        
+        try:
+            result = quick_test(
+                model_path=model_path,
+                num_episodes=8,  # Fewer episodes for comparison
+                render=False,  # No rendering for batch comparison
+                verbose=False
+            )
+            results[algorithm] = result
+            print(f"   ✅ {algorithm} completed")
+        except Exception as e:
+            print(f"   ❌ {algorithm} failed: {e}")
+    
+    # Generate comparison report
+    print(f"\n{'='*80}")
+    print("📈 ALGORITHM COMPARISON REPORT")
+    print(f"{'='*80}")
+    
+    if len(results) < 2:
+        print("❌ Not enough successful evaluations for comparison")
+        return
+    
+    print(f"{'Algorithm':<10} {'Success%':<10} {'Avg Reward':<12} {'Avg Distance':<13} {'Angle Error°':<12}")
+    print("-" * 70)
+    
+    sorted_results = sorted(results.items(), key=lambda x: x[1]['success_rate'], reverse=True)
+    
+    for algorithm, result in sorted_results:
+        success_pct = result['success_rate'] * 100
+        print(f"{algorithm:<10} {success_pct:<10.1f} {result['avg_reward']:<12.2f} {result['avg_min_distance']:<13.3f} {result['avg_angle_error']:<12.1f}")
+    
+    # Highlight best performer
+    best_algorithm = sorted_results[0][0]
+    best_result = sorted_results[0][1]
+    
+    print(f"\n🏆 Best Performing Algorithm: {best_algorithm}")
+    print(f"   Success Rate: {best_result['success_rate']*100:.1f}%")
+    print(f"   Avg Reward: {best_result['avg_reward']:.2f}")
+    print(f"   Avg Distance: {best_result['avg_min_distance']:.3f}")
+
+def main():
+    """Main function with command line interface"""
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == '--compare':
+        compare_algorithms()
+        return
+    
+    # Default parameters
+    episodes = 5
+    render = True
+    model_path = None
+    
+    # Parse command line arguments
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == '--episodes':
+            episodes = int(sys.argv[i+1])
+            i += 2
+        elif arg == '--no-render':
+            render = False
+            i += 1
+        elif arg == '--model':
+            model_path = sys.argv[i+1]
+            i += 2
+        else:
+            # Assume it's a model path
+            model_path = arg
+            i += 1
+    
+    print("🧪 Quick Evaluation Tool (All Algorithms)")
+    print("=" * 50)
+    print(f"Episodes: {episodes}")
+    print(f"Rendering: {render}")
+    if model_path:
+        print(f"Model: {model_path}")
+    
+    quick_test(model_path=model_path, num_episodes=episodes, render=render)
 
 if __name__ == "__main__":
-    # Check if a model file was specified
-    model_file = sys.argv[1] if len(sys.argv) > 1 else None
-    quick_test(model_file)
+    main()
