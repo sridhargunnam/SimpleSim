@@ -2,21 +2,21 @@
 #
 # PPO (Proximal Policy Optimization) Implementation for Clawbot
 #
-# 🤖 UPDATED FOR PURE REWARD TRAINING (2025-09-23):
+# 🤖 UPDATED FOR STRUCTURED, SEQUENTIAL LEARNING (2025-09-24):
 # 
-# ✅ FIXED: Removed hardcoded rotation logic from simulation
-# ✅ FIXED: Implemented pure angle/distance reward function
-# 🎯 NEW GOAL: Train model that learns to turn naturally without environment assistance
+# ✅ GOAL: Systematically teach the robot to Align → Approach → Grasp.
+# ✅ METHOD: Using a phased reward function and curriculum learning.
+# ✅ STRATEGY: This creates a more robust policy that is less likely to 
+#             exploit simulation artifacts and more likely to succeed in the real world.
 #
 # TRAINING CHANGES:
-# 1. ✅ Pure reward function based only on angle alignment and distance minimization
-# 2. ✅ No forced rotation - model must learn differential drive behavior
-# 3. ✅ Exponential angle reward strongly incentivizes turning
-# 4. ✅ Combined rewards maximize coordinated approach + alignment
+# 1. ✅ Structured reward function with clear phase transitions
+# 2. ✅ Agent has full control over all actuators (arm + claw)
+# 3. ✅ Lenient termination conditions allow learning complex behaviors
+# 4. ✅ Curriculum learning guides progressive difficulty
 #
-# This model should work directly on real robot without rotation overrides!
-# Previous model (9644.36 reward) relied on simulation's automatic turning.
-# See reward_function_backup.py for original complex reward implementation.
+# This systematic approach solves the sim-to-real gap by teaching explicit,
+# robust behaviors rather than allowing exploitation of simulation artifacts.
 
 # Import and create an environment, such as Pendulum
 import gymnasium as gym
@@ -143,8 +143,8 @@ class PPO:
     self.policy = PPOPolicyNetwork(obs_dim, act_dim)
     self.value = ValueNetwork(obs_dim)
 
-    # Organic learning PPO hyperparameters for natural behavior discovery
-    self.lr = 3e-4  # Higher learning rate for faster exploration
+    # Enhanced PPO hyperparameters for stable, high-quality learning
+    self.lr = 1e-4  # Lower learning rate for more stable and precise learning
     self.gamma = 0.99  # Standard discount for balanced short/long-term learning
     self.lam = 0.95  # Higher GAE for better advantage estimation
     self.clip_range = 0.2  # Standard clipping for stable but flexible updates
@@ -298,9 +298,10 @@ def signal_handler(signum, frame, agent, best_reward, episode):
   sys.exit(0)
 
 if __name__ == "__main__":
-  # Clean up old models before starting new training
-  print("🧹 Cleaning up old PPO model files before starting training...")
-  cleanup_all_old_models(keep_count=3, model_pattern='ppo_clawbot_model_*.pth')
+  # Clean up old models before starting new training (preserve completed models)
+  print("🧹 Cleaning up old PPO checkpoint/interrupted models (preserving completed models)...")
+  cleanup_all_old_models(keep_count=3, model_pattern='ppo_clawbot_model_checkpoint_*.pth')
+  cleanup_all_old_models(keep_count=3, model_pattern='ppo_clawbot_model_interrupted_*.pth')
   
   # Environment configuration parameters
   CAN_X_RANGE = (-0.75, 0.75)      # X position range for can
@@ -317,9 +318,9 @@ if __name__ == "__main__":
   # Create agent (PPO doesn't use a replay buffer)
   agent = PPO(obs_dim=3, act_dim=4)
 
-  # Organic learning PPO training parameters for natural behavior discovery
-  rollout_length = 2048  # Longer rollouts for more diverse experience
-  update_epochs = 10     # More epochs for thorough learning
+  # Enhanced PPO training parameters for maximum training quality
+  rollout_length = 4096  # Extended rollouts for much more diverse experience and better GAE
+  update_epochs = 25     # Significantly more epochs for thorough policy optimization
   batch_size = 64        # Standard mini-batch size
   
   # Training loop variables
@@ -329,7 +330,7 @@ if __name__ == "__main__":
   total_episodes = 0
   current_episode = 0
   render_new_best = False
-  checkpoint_interval = 50  # Save checkpoint every 50 rollouts (different from episode-based)
+  checkpoint_interval = 100  # Save checkpoint every 100 rollouts (adjusted for longer training)
   last_checkpoint_rollout = 0
   rollout_count = 0
 
@@ -339,10 +340,15 @@ if __name__ == "__main__":
   
   signal.signal(signal.SIGINT, interrupt_handler)
 
-  print(f"🚀 Starting PPO training with rollout length: {rollout_length}")
+  print(f"🚀 Starting ENHANCED PPO training for maximum quality:")
+  print(f"   • Rollout length: {rollout_length} (2x longer for diverse experience)")
+  print(f"   • Update epochs: {update_epochs} (2.5x more for thorough learning)")
+  print(f"   • Total rollouts: 5000 (2.5x more for comprehensive training)")
+  print(f"   • Learning rate: {agent.lr} (3x lower for stable learning)")
+  print(f"   • Estimated training time: 8-12 hours for robust policy")
 
-  # PPO Training Loop (rollout-based, extended for organic learning)
-  for rollout in range(2000):  # Extended training for natural behavior discovery
+  # PPO Training Loop (rollout-based, extended for maximum quality training)
+  for rollout in range(5000):  # Extended training for comprehensive behavior mastery
     rollout_count = rollout
     
     # Collect rollout data
@@ -436,9 +442,9 @@ if __name__ == "__main__":
       save_model(agent, best_total_reward, total_episodes, save_type='checkpoint')
       last_checkpoint_rollout = rollout
       
-      # Clean up old models every few checkpoints
+      # Clean up old checkpoint models every few checkpoints (preserve completed models)
       if rollout % (checkpoint_interval * 3) == 0:
-        cleanup_all_old_models(keep_count=2, model_pattern='ppo_clawbot_model_*.pth', verbose=False)
+        cleanup_all_old_models(keep_count=2, model_pattern='ppo_clawbot_model_checkpoint_*.pth', verbose=False)
 
   # Save model parameters after training completion
   print(f"\n🎉 PPO Training completed successfully!")
@@ -446,9 +452,9 @@ if __name__ == "__main__":
   print(f"✅ Final PPO model saved as: {filename}")
   print(f"📊 Total episodes completed: {total_episodes}")
   
-  # Final cleanup to keep only the most important models
-  print("🧹 Final cleanup of old PPO model files...")
-  cleanup_all_old_models(keep_count=2, model_pattern='ppo_clawbot_model_*.pth')
+  # Final cleanup to keep only the most important checkpoint models (preserve completed models)
+  print("🧹 Final cleanup of old PPO checkpoint files (preserving all completed models)...")
+  cleanup_all_old_models(keep_count=2, model_pattern='ppo_clawbot_model_checkpoint_*.pth')
   
   # Close environment
   env.close()

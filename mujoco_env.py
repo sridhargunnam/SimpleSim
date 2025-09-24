@@ -151,59 +151,64 @@ class ClawbotCan:
 
   def reward(self, state, action, info=None):
     """
-    ORGANIC LEARNING REWARD FUNCTION
+    STRUCTURED REWARD FOR SEQUENTIAL LEARNING
     
-    Simple, natural incentives that allow emergent behavior discovery.
-    No complex gates, penalties, or forced sequences.
-    
-    Philosophy: Like nature - simple physics leads to complex behaviors.
-    The robot should discover rotation, translation, and grabbing naturally.
+    This function explicitly guides the agent through three phases:
+    1. ALIGN: If the angle to the target is large, only reward turning.
+    2. APPROACH: If the angle is small, reward moving closer.
+    3. GRASP: If close enough, give a massive bonus for grabbing.
     """
     distance, dtheta, objectGrabbed = state
     
-    # === CORE NATURAL INCENTIVES ===
-    
-    # 1. PROXIMITY REWARD: Always good to be closer (primary drive)
-    proximity_reward = 10.0 / (1.0 + distance)
-    
-    # 2. ALIGNMENT REWARD: Better when facing target (secondary drive)  
-    alignment_reward = 5.0 * np.exp(-abs(dtheta))
-    
-    # 3. SUCCESS REWARD: Big payoff for grabbing (ultimate goal)
-    success_reward = 1000.0 if objectGrabbed else 0.0
-    
-    # === PROGRESS INCENTIVES ===
-    
-    # 4. PROGRESS BONUS: Reward improvement over time
-    progress_bonus = 0.0
-    if self.last_distance is not None:
-        distance_improvement = max(0, self.last_distance - distance)
-        progress_bonus = 20.0 * distance_improvement  # Strong progress incentive
-    
-    # 5. EXPLORATION BONUS: Slight reward for any movement (avoid getting stuck)
-    movement = abs(action[0]) + abs(action[1]) + abs(action[2]) + abs(action[3])
-    exploration_bonus = 0.5 * movement if movement > 0.1 else 0.0
-    
-    # === MINIMAL CONSTRAINTS ===
-    
-    # 6. MILD TIME PRESSURE: Encourage efficiency without rushing
-    time_cost = -0.01
-    
-    # === TOTAL REWARD ===
-    total_reward = (proximity_reward + alignment_reward + success_reward + 
-                   progress_bonus + exploration_bonus + time_cost)
-    
-    # Update tracking
-    self.last_distance = distance
-    
-    # Optional: Log reward components for debugging (every 100 steps)
-    if hasattr(self, '_steps') and self._steps % 100 == 0:
-        self._log_reward_components(
-            distance, dtheta, proximity_reward, alignment_reward, 
-            progress_bonus, exploration_bonus, total_reward
-        )
-    
-    return total_reward
+    # --- Define thresholds for switching between phases ---
+    ALIGNMENT_THRESHOLD = 0.3  # Radians (~17 degrees) - more lenient for transition
+    APPROACH_THRESHOLD = 0.05  # Meters (5 cm)
+
+    # =================================================
+    # PHASE 3: GRASP (Highest Priority)
+    # =================================================
+    if objectGrabbed:
+      return 1000.0  # Huge, definitive reward for success
+
+    # =================================================
+    # PHASE 1: ALIGN (When angle is large)
+    # =================================================
+    if abs(dtheta) > ALIGNMENT_THRESHOLD:
+      # Reward is focused *only* on alignment. We use an exponential reward
+      # to give a strong signal as the agent gets closer to the correct heading.
+      # Distance is ignored here to prevent the agent from moving forward prematurely.
+      alignment_reward = 10.0 * np.exp(-2.0 * abs(dtheta))
+      
+      # Optional: Log reward components for debugging (every 100 steps)
+      if hasattr(self, '_steps') and self._steps % 100 == 0:
+          print(f"Step {self._steps}: ALIGN PHASE - d={distance:.2f}, θ={np.degrees(dtheta):.1f}° | "
+                f"alignment_reward={alignment_reward:.2f}")
+      
+      return alignment_reward - 0.5 # Small time penalty to encourage action
+
+    # =================================================
+    # PHASE 2: APPROACH (When aligned) - v2.2 with forward movement incentive
+    # =================================================
+    else: # abs(dtheta) <= ALIGNMENT_THRESHOLD
+      # Once aligned, reward reducing distance AND forward movement actions
+      proximity_reward = 20.0 / (1.0 + 10.0 * distance)
+      
+      # We still include a small penalty for losing alignment.
+      # This ensures the robot stays pointed at the target as it moves.
+      alignment_penalty = -5.0 * abs(dtheta)
+      
+      # NEW v2.2: Explicit forward movement incentive
+      forward_bonus = 5.0 * max(0, action[0])  # Reward forward movement actions
+      
+      total_reward = proximity_reward + alignment_penalty + forward_bonus - 0.1 # Small time penalty
+      
+      # Optional: Log reward components for debugging (every 100 steps)
+      if hasattr(self, '_steps') and self._steps % 100 == 0:
+          print(f"Step {self._steps}: APPROACH PHASE v2.2 - d={distance:.2f}, θ={np.degrees(dtheta):.1f}° | "
+                f"proximity={proximity_reward:.2f}, align_penalty={alignment_penalty:.2f}, "
+                f"forward_bonus={forward_bonus:.2f}, total={total_reward:.2f}")
+      
+      return total_reward
   
   def _log_reward_components(self, distance, dtheta, proximity_reward, alignment_reward, 
                            progress_bonus, exploration_bonus, total_reward):
@@ -263,6 +268,7 @@ class ClawbotCan:
     
     return pos
 
+
   def get_curriculum_info(self):
     """Get current curriculum level info for logging"""
     current_level = min(4, (self.episode_count // 500) + 1)
@@ -271,11 +277,10 @@ class ClawbotCan:
 
   def terminal(self, state, action):
     distance, dtheta, objectGrabbed = state
-    # Fix: Much more lenient angle termination - only fail if facing completely wrong (>150°)
-    is_facing_completely_wrong = abs(dtheta) > (5 * np.pi / 6)  # 150 degrees
-    # Also terminate if robot gets stuck very far away
-    is_too_far = distance > 2.0
-    return self._steps >= 1500 or objectGrabbed or is_facing_completely_wrong or is_too_far
+    # Terminate only on success, timeout, or if robot gets completely lost
+    is_too_far = distance > 2.0 # Terminate if it gets lost
+    # The new reward function will penalize bad alignment, so we don't need to terminate.
+    return self._steps >= 1500 or objectGrabbed or is_too_far
 
   def reset(self):
     self.prev_action = np.array([0.0, 0.0, 0.0, 0.0]) 
@@ -307,9 +312,8 @@ class ClawbotCan:
     return s, info
 
   def step(self, action, time_duration=0.05):
-    # for now, disable arm, and restrict the claw to only move in the open direction
-    action[2] = 0 # TODO: to disable the arm
-    action[3] = action[3] / 2 - 0.5 # TODO: To restrict the claw to only move in the open direction
+    # REMOVED: Hardcoded action restrictions - agent now has full control
+    # The new structured reward function will teach proper arm and claw usage
 
     # REMOVED: Forced rotation logic - let the model learn to turn naturally
     # The new reward function will incentivize proper turning behavior
