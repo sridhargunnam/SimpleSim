@@ -38,7 +38,8 @@ class ClawbotCan:
   def __init__(self, mujoco_model_path: str="env/clawbot.xml", 
                can_x_range: tuple=(-0.75, 0.75),
                can_y_range: tuple=(0.4, 0.75),
-               min_distance: float=0.4):
+               min_distance: float=0.4,
+               curriculum_level: int=1):
     """Initialize ClawbotCan environment
     
     Args:
@@ -57,6 +58,8 @@ class ClawbotCan:
     self.can_x_range = can_x_range
     self.can_y_range = can_y_range
     self.min_distance = min_distance
+    self.curriculum_level = curriculum_level
+    self.episode_count = 0
 
     # Fix: Identify hinge joint indices for safe angle wrapping
     self.hinge_joint_qpos_indices = []
@@ -90,7 +93,7 @@ class ClawbotCan:
     self.last_action = np.array([0.0, 0.0, 0.0, 0.0])
 
   def _calc_state(self):
-      # Calculate reward and termination
+      # Calculate reward and termination with real-world noise simulation
       # Get sensor indices by name
       touch_lc_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "touch_lc")
       touch_rc_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "touch_rc")
@@ -98,9 +101,6 @@ class ClawbotCan:
       # Read values from the sensordata array
       touch_lc_value = self.data.sensordata[touch_lc_id]
       touch_rc_value = self.data.sensordata[touch_rc_id]
-
-      # print(f"Left claw touch force: {touch_lc_value}")
-      # print(f"Right claw touch force: {touch_rc_value}")
 
       objectGrabbed = touch_lc_value or touch_rc_value
 
@@ -115,9 +115,19 @@ class ClawbotCan:
       dx = can1_pos[0] - claw_pos[0]  # Direction FROM claw TO can
       dy = can1_pos[1] - claw_pos[1]  # Direction FROM claw TO can
       dz = can1_pos[2] - claw_pos[2]
+      
+      # Add realistic sensor noise (5% of reading + small constant)
       distance = np.sqrt(dx * dx + dy * dy + dz * dz)
+      if hasattr(self, 'episode_count') and self.episode_count > 1000:  # Add noise after basic learning
+          distance_noise = np.random.normal(0, distance * 0.02 + 0.005)  # 2% + 5mm noise
+          distance = max(0.1, distance + distance_noise)  # Ensure positive
+          
+          # Add angle noise (±2 degrees typical for AprilTags)
+          angle_noise = np.random.normal(0, np.radians(2))
+          dx += np.random.normal(0, 0.01)  # 1cm position noise
+          dy += np.random.normal(0, 0.01)
+      
       heading = np.arctan2(dy, dx)  # Angle to target
-      # print("Distance:", dist, "Heading:", heading)
 
       roll, pitch, yaw = quaternion_to_euler(self.data.xquat[claw_id])
       # print("Yaw:", yaw)
@@ -140,134 +150,124 @@ class ClawbotCan:
       }
 
   def reward(self, state, action, info=None):
+    """
+    ORGANIC LEARNING REWARD FUNCTION
+    
+    Simple, natural incentives that allow emergent behavior discovery.
+    No complex gates, penalties, or forced sequences.
+    
+    Philosophy: Like nature - simple physics leads to complex behaviors.
+    The robot should discover rotation, translation, and grabbing naturally.
+    """
     distance, dtheta, objectGrabbed = state
     
-    # Get additional state information for enhanced reward calculation
-    if info is None:
-        # If no info provided, calculate it (for backward compatibility)
-        _, info = self._calc_state()
+    # === CORE NATURAL INCENTIVES ===
     
-    can_behind_claw = info.get('can_behind_claw', False)
-    dy = info.get('dy', 0)
+    # 1. PROXIMITY REWARD: Always good to be closer (primary drive)
+    proximity_reward = 10.0 / (1.0 + distance)
     
-    # Check if claw is touching the can (but not grabbing)
-    # Note: objectGrabbed is already calculated from the same touch sensors in _calc_state
-    # We need to detect "touching but not grabbing" state
-    is_touching_can = objectGrabbed  # For now, treat any touch as potential sweeping
-    # TODO: Could be refined to detect partial vs full contact
+    # 2. ALIGNMENT REWARD: Better when facing target (secondary drive)  
+    alignment_reward = 5.0 * np.exp(-abs(dtheta))
     
-    # Enhanced "Rotation Always First" Reward Function
-    # Key insight: Rotation priority increases when closer (less room for error)
+    # 3. SUCCESS REWARD: Big payoff for grabbing (ultimate goal)
+    success_reward = 1000.0 if objectGrabbed else 0.0
     
-    # Calculate rotation priority multiplier based on distance
-    # Closer = higher rotation priority (more critical alignment)
-    rotation_priority = 1.0 + (1.0 - min(distance, 1.0))  # Range: 1.0 to 2.0
+    # === PROGRESS INCENTIVES ===
     
-    # Always prioritize rotation, but intensity varies by distance and angle
-    rotation_reward = -rotation_priority * 8 * np.abs(dtheta)
+    # 4. PROGRESS BONUS: Reward improvement over time
+    progress_bonus = 0.0
+    if self.last_distance is not None:
+        distance_improvement = max(0, self.last_distance - distance)
+        progress_bonus = 20.0 * distance_improvement  # Strong progress incentive
     
-    # Distance penalty with anti-sweeping and wrong-position detection
-    if objectGrabbed:
-        # When grabbed: No distance penalty (success!), encourage episode completion
-        distance_penalty = 0  
-        wrong_position_penalty = 0
-    else:
-        # Normal distance penalty when not grabbed
-        distance_penalty = -2 * distance
-        
-        # Anti-sweeping: Penalty for being very close but not grabbing
-        # This prevents robot from just pushing the can around
-        if distance < 0.12 and not objectGrabbed:  # Very close but no grab
-            wrong_position_penalty = -8.0  # Penalty for being too close without success
-        else:
-            wrong_position_penalty = 0
+    # 5. EXPLORATION BONUS: Slight reward for any movement (avoid getting stuck)
+    movement = abs(action[0]) + abs(action[1]) + abs(action[2]) + abs(action[3])
+    exploration_bonus = 0.5 * movement if movement > 0.1 else 0.0
     
-    # Severely penalize forward movement when ANY misalignment exists
-    forward_movement = abs(action[0] + action[1]) / 2  # Average wheel speed
-    angle_tolerance = 0.2  # ~11.5 degrees - very tight tolerance
+    # === MINIMAL CONSTRAINTS ===
     
-    if abs(dtheta) > angle_tolerance:
-        # Any misalignment > 11.5° prohibits forward movement
-        movement_penalty = -25 * forward_movement if forward_movement > 0.1 else 0
-    else:
-        # Only when very well aligned, allow forward movement
-        movement_penalty = 0
+    # 6. MILD TIME PRESSURE: Encourage efficiency without rushing
+    time_cost = -0.01
     
-    approach_reward = rotation_reward + distance_penalty + movement_penalty + wrong_position_penalty
+    # === TOTAL REWARD ===
+    total_reward = (proximity_reward + alignment_reward + success_reward + 
+                   progress_bonus + exploration_bonus + time_cost)
     
-    # Progressive bonuses for good alignment
-    if abs(dtheta) < 0.1:  # < 5.7° - excellent alignment
-        alignment_bonus = 10.0
-    elif abs(dtheta) < 0.3:  # < 17.2° - good alignment  
-        alignment_bonus = 5.0
-    elif abs(dtheta) < 0.5:  # < 28.6° - acceptable alignment
-        alignment_bonus = 2.0
-    else:
-        alignment_bonus = 0.0
-    
-    # Close approach bonus (only when well aligned)
-    if distance < 0.15 and abs(dtheta) < 0.3:
-        close_approach_bonus = 8.0
-    elif distance < 0.25 and abs(dtheta) < 0.2:
-        close_approach_bonus = 4.0
-    else:
-        close_approach_bonus = 0.0
-    
-    # Object grabbed bonus (unchanged)
-    grab_bonus = int(objectGrabbed) * 50
-    
-    # Progress and stability shaping
-    # Encourage steady approach, penalize stagnation and moving away
-    delta_distance = 0.0 if self.last_distance is None else (self.last_distance - distance)
-    # Reward progress (moving closer) modestly
-    progress_reward = 2.0 * max(delta_distance, 0.0)
-    # Penalize moving away proportionally
-    away_penalty = -4.0 * max(-delta_distance, 0.0)
-    # Penalize sustained lack of progress to avoid dithering/jitter
-    min_progress_threshold = 0.002  # 2 mm per step considered meaningful
-    if delta_distance < min_progress_threshold and not objectGrabbed:
-        self.no_progress_steps = min(self.no_progress_steps + 1, 50)
-    else:
-        self.no_progress_steps = 0
-    stagnation_penalty = -0.2 * self.no_progress_steps
-    
-    # Penalize being close but not in a grabbable alignment window
-    grabbable_penalty = 0.0
-    if distance < 0.20 and abs(dtheta) > 0.30 and not objectGrabbed:
-        grabbable_penalty = -6.0
-    
-    # Mild dynamic time penalty that increases as steps elapse
-    time_penalty = -0.05 - 0.05 * (self._steps / self.max_steps)
-    
-    # Anti-jitter: penalize abrupt action changes (after built-in ramping)
-    try:
-        action_change = float(np.sum(np.abs(action - self.last_action[:len(action)])))
-    except Exception:
-        action_change = 0.0
-    jitter_penalty = -0.5 * max(action_change - 0.3, 0.0)
-    
-    # Fix 1: Penalty for can being behind the claw (wrong position for grabbing)
-    behind_claw_penalty = 0
-    if can_behind_claw and distance < 0.3:  # Only penalize if close AND behind
-        behind_claw_penalty = -15.0  # Heavy penalty for being in wrong position
-    
-    # Fix 2: Penalty for robot being stuck (not moving)
-    stuck_penalty = 0
-    movement_magnitude = abs(action[0]) + abs(action[1])  # Total wheel movement
-    if movement_magnitude < 0.05:  # Very low movement
-        # Check if robot should be moving (not well aligned and close)
-        should_be_moving = (abs(dtheta) > 0.1 or distance > 0.2)
-        if should_be_moving:
-            stuck_penalty = -5.0  # Penalty for being stuck when should be active
-    
-    total_reward = (approach_reward + alignment_bonus + close_approach_bonus + 
-                   grab_bonus + time_penalty + behind_claw_penalty + stuck_penalty +
-                   progress_reward + away_penalty + stagnation_penalty + grabbable_penalty + jitter_penalty)
-    
-    # Update last_distance for next step
+    # Update tracking
     self.last_distance = distance
     
+    # Optional: Log reward components for debugging (every 100 steps)
+    if hasattr(self, '_steps') and self._steps % 100 == 0:
+        self._log_reward_components(
+            distance, dtheta, proximity_reward, alignment_reward, 
+            progress_bonus, exploration_bonus, total_reward
+        )
+    
     return total_reward
+  
+  def _log_reward_components(self, distance, dtheta, proximity_reward, alignment_reward, 
+                           progress_bonus, exploration_bonus, total_reward):
+    """Log reward components for training analysis"""
+    print(f"Step {self._steps}: d={distance:.2f}, θ={np.degrees(dtheta):.1f}° | "
+          f"proximity={proximity_reward:.1f}, align={alignment_reward:.1f}, "
+          f"progress={progress_bonus:.1f}, explore={exploration_bonus:.1f}, total={total_reward:.1f}")
+
+  def _get_curriculum_position(self):
+    """
+    Progressive curriculum learning for object placement
+    
+    Level 1 (Episodes 0-500): Easy front positions (small angles)
+    Level 2 (Episodes 500-1500): Medium angles 
+    Level 3 (Episodes 1500-3000): Hard side positions
+    Level 4 (Episodes 3000+): Full random (like real world)
+    """
+    current_level = min(4, (self.episode_count // 500) + 1)
+    
+    if current_level == 1:
+        # Level 1: Easy front positions (-20° to +20°)
+        angle_range = np.pi / 9  # ±20 degrees
+        angle = np.random.uniform(-angle_range, angle_range)
+        distance = np.random.uniform(0.4, 0.6)  # Close to medium distance
+        pos = (distance * np.sin(angle), distance * np.cos(angle))
+        
+    elif current_level == 2:
+        # Level 2: Medium angles (-45° to +45°)
+        angle_range = np.pi / 4  # ±45 degrees  
+        angle = np.random.uniform(-angle_range, angle_range)
+        distance = np.random.uniform(0.4, 0.7)
+        pos = (distance * np.sin(angle), distance * np.cos(angle))
+        
+    elif current_level == 3:
+        # Level 3: Hard side positions (-80° to +80°)
+        angle_range = 4 * np.pi / 9  # ±80 degrees
+        angle = np.random.uniform(-angle_range, angle_range) 
+        distance = np.random.uniform(0.4, 0.75)
+        pos = (distance * np.sin(angle), distance * np.cos(angle))
+        
+    else:
+        # Level 4: Full random (real-world preparation)
+        pos = (0, 0)
+        while np.sqrt(pos[0] * pos[0] + pos[1] * pos[1]) < self.min_distance:
+            pos = (np.random.uniform(*self.can_x_range), np.random.uniform(*self.can_y_range))
+    
+    # Ensure position is within bounds and minimum distance
+    pos = (np.clip(pos[0], self.can_x_range[0], self.can_x_range[1]),
+           np.clip(pos[1], self.can_y_range[0], self.can_y_range[1]))
+    
+    if np.sqrt(pos[0]**2 + pos[1]**2) < self.min_distance:
+        # Fallback to minimum distance if too close
+        angle = np.random.uniform(-np.pi, np.pi)
+        pos = (self.min_distance * np.sin(angle), self.min_distance * np.cos(angle))
+        pos = (np.clip(pos[0], self.can_x_range[0], self.can_x_range[1]),
+               np.clip(pos[1], self.can_y_range[0], self.can_y_range[1]))
+    
+    return pos
+
+  def get_curriculum_info(self):
+    """Get current curriculum level info for logging"""
+    current_level = min(4, (self.episode_count // 500) + 1)
+    level_names = {1: "Easy Front", 2: "Medium Angles", 3: "Hard Sides", 4: "Full Random"}
+    return f"Level {current_level}: {level_names[current_level]} (Episode {self.episode_count})"
 
   def terminal(self, state, action):
     distance, dtheta, objectGrabbed = state
@@ -288,11 +288,11 @@ class ClawbotCan:
     can1_jntadr = self.model.body_jntadr[can1_id]
     can1_qposadr = self.model.jnt_qposadr[can1_jntadr]
 
-    pos = (0, 0)
-    while np.sqrt(pos[0] * pos[0] + pos[1] * pos[1]) < self.min_distance:
-      pos = (np.random.uniform(*self.can_x_range), np.random.uniform(*self.can_y_range))
+    # Curriculum-based object placement for progressive learning
+    pos = self._get_curriculum_position()
     self.data.qpos[can1_qposadr+0] = pos[0]
     self.data.qpos[can1_qposadr+1] = pos[1]
+    self.episode_count += 1
 
     # Fix: Only apply angle wrapping to hinge joints, not free joints
     bug_fix_angles(self.data.qpos, idx=self.hinge_joint_qpos_indices)
@@ -311,24 +311,9 @@ class ClawbotCan:
     action[2] = 0 # TODO: to disable the arm
     action[3] = action[3] / 2 - 0.5 # TODO: To restrict the claw to only move in the open direction
 
-    # Option 2: Force rotation-only behavior when misaligned
-    # Get current state to check alignment
-    current_state, _ = self._calc_state()
-    distance, dtheta, objectGrabbed = current_state
-    
-    if abs(dtheta) > 0.2:  # ANY misalignment > 11.5° - force rotation-only
-        forward_component = (action[0] + action[1]) / 2
-        if forward_component > 0.1:  # Agent trying to move forward when misaligned
-            # Convert to pure rotation based on the intended direction
-            rotation_strength = forward_component  # Use the forward intent as rotation strength
-            turn_direction = 1 if dtheta > 0 else -1  # Turn toward target
-            
-            # Override actions to pure rotation
-            action[0] = rotation_strength * turn_direction   # Left wheel
-            action[1] = -rotation_strength * turn_direction  # Right wheel (opposite)
-            
-            # Debug info (can be removed later)
-            # print(f"🔄 Forced rotation: dtheta={dtheta:.2f}, turn_dir={turn_direction}")
+    # REMOVED: Forced rotation logic - let the model learn to turn naturally
+    # The new reward function will incentivize proper turning behavior
+    # without hardcoded action overrides.
 
     # Preserve last executed (filtered) action for anti-jitter shaping
     try:

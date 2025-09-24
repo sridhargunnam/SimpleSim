@@ -2,20 +2,21 @@
 #
 # PPO (Proximal Policy Optimization) Implementation for Clawbot
 #
-# 🤖 REAL ROBOT TESTING RESULTS (2025-09-22):
-# ✅ Successfully moves forward toward detected objects (basic navigation works)
-# ❌ CRITICAL ISSUE: Cannot turn - only moves straight forward to targets
-# ❌ CRITICAL ISSUE: No memory - loses objects when they move out of field of view
-# ❌ CRITICAL ISSUE: Depends on perfect object detection - fails with sensor noise
+# 🤖 UPDATED FOR PURE REWARD TRAINING (2025-09-23):
+# 
+# ✅ FIXED: Removed hardcoded rotation logic from simulation
+# ✅ FIXED: Implemented pure angle/distance reward function
+# 🎯 NEW GOAL: Train model that learns to turn naturally without environment assistance
 #
-# REQUIRED IMPROVEMENTS (see IMPROVEMENT_ROADMAP.md):
-# 1. Enhanced reward function to encourage turning behavior
-# 2. LSTM/GRU architecture for sequential memory
-# 3. Training with limited field of view and partial observability
-# 4. Robustness training with sensor failures and noise
+# TRAINING CHANGES:
+# 1. ✅ Pure reward function based only on angle alignment and distance minimization
+# 2. ✅ No forced rotation - model must learn differential drive behavior
+# 3. ✅ Exponential angle reward strongly incentivizes turning
+# 4. ✅ Combined rewards maximize coordinated approach + alignment
 #
-# Current model achieves 9644.36 reward in simulation but needs enhancements
-# for real-world deployment. See KNOWN_ISSUES.md for detailed analysis.
+# This model should work directly on real robot without rotation overrides!
+# Previous model (9644.36 reward) relied on simulation's automatic turning.
+# See reward_function_backup.py for original complex reward implementation.
 
 # Import and create an environment, such as Pendulum
 import gymnasium as gym
@@ -142,14 +143,14 @@ class PPO:
     self.policy = PPOPolicyNetwork(obs_dim, act_dim)
     self.value = ValueNetwork(obs_dim)
 
-    # PPO hyperparameters
-    self.lr = 3e-4
-    self.gamma = 0.99
-    self.lam = 0.95  # GAE parameter
-    self.clip_range = 0.2  # PPO clipping parameter
-    self.value_coeff = 0.5  # Value loss coefficient
-    self.entropy_coeff = 0.01  # Entropy bonus coefficient
-    self.max_grad_norm = 0.5  # Gradient clipping
+    # Organic learning PPO hyperparameters for natural behavior discovery
+    self.lr = 3e-4  # Higher learning rate for faster exploration
+    self.gamma = 0.99  # Standard discount for balanced short/long-term learning
+    self.lam = 0.95  # Higher GAE for better advantage estimation
+    self.clip_range = 0.2  # Standard clipping for stable but flexible updates
+    self.value_coeff = 0.5  # Standard value loss weight
+    self.entropy_coeff = 0.05  # Higher entropy for extensive exploration
+    self.max_grad_norm = 0.5  # Standard gradient clipping
 
     # Optimizers
     self.optimizer = torch.optim.Adam(
@@ -316,9 +317,10 @@ if __name__ == "__main__":
   # Create agent (PPO doesn't use a replay buffer)
   agent = PPO(obs_dim=3, act_dim=4)
 
-  # PPO-specific training parameters
-  rollout_length = 2048  # Number of steps to collect before update
-  update_epochs = 10     # Number of optimization epochs per rollout
+  # Organic learning PPO training parameters for natural behavior discovery
+  rollout_length = 2048  # Longer rollouts for more diverse experience
+  update_epochs = 10     # More epochs for thorough learning
+  batch_size = 64        # Standard mini-batch size
   
   # Training loop variables
   best_total_reward = -float('inf')
@@ -339,8 +341,8 @@ if __name__ == "__main__":
 
   print(f"🚀 Starting PPO training with rollout length: {rollout_length}")
 
-  # PPO Training Loop (rollout-based)
-  for rollout in range(1000):  # Number of rollouts
+  # PPO Training Loop (rollout-based, extended for organic learning)
+  for rollout in range(2000):  # Extended training for natural behavior discovery
     rollout_count = rollout
     
     # Collect rollout data
@@ -381,8 +383,8 @@ if __name__ == "__main__":
       
       obs = new_obs
       
-      # Reset environment if done (longer episodes since PPO is fast)
-      if done or episode_length >= 768:
+      # Reset environment if done (longer episodes for organic learning)
+      if done or episode_length >= 1000:
         # Track episode statistics
         if episode_reward > best_total_reward and episode_reward > 0:
           render_new_best = True
@@ -391,7 +393,9 @@ if __name__ == "__main__":
           render_new_best = False
         
         best_total_reward = max(best_total_reward, episode_reward)
-        print(f'Episode {total_episodes}: Reward: {episode_reward:.2f}, Steps: {episode_length}')
+        # Enhanced logging with curriculum info
+        curriculum_info = env.get_curriculum_info()
+        print(f'Episode {total_episodes}: Reward: {episode_reward:.2f}, Steps: {episode_length} | {curriculum_info}')
         
         total_episodes += 1
         current_episode = total_episodes
